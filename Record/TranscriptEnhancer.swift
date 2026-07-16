@@ -49,12 +49,24 @@ final class TranscriptEnhancer: Sendable {
         var segments: [SpeakerSegment]?
         do {
             segments = try await diarize(input, progress: progress)
+            Self.logger.notice("Diarization produced \(segments?.count ?? -1, privacy: .public) segments")
+            if let segments {
+                let talkTimes = Dictionary(grouping: segments, by: \.speakerID)
+                    .mapValues { $0.reduce(0) { $0 + ($1.end - $1.start) } }
+                    .map { "\($0.key): \(Int($0.value))s" }
+                    .sorted()
+                    .joined(separator: ", ")
+                Self.logger.notice("Speaker talk times: [\(talkTimes, privacy: .public)]")
+            }
         } catch {
-            Self.logger.error("Diarization skipped: \(error.localizedDescription)")
+            Self.logger.error("Diarization skipped: \(error.localizedDescription, privacy: .public)")
             segments = nil
         }
         afterAudioConsumed()
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled else {
+            Self.logger.notice("Enhancement cancelled after diarization stage")
+            return nil
+        }
 
         var turns: [SpeakerTurn]
         if let segments, !input.chunks.isEmpty {
@@ -65,10 +77,22 @@ final class TranscriptEnhancer: Sendable {
             turns = TranscriptComposer.paragraphs(fromRawText: input.rawText)
         }
         guard !turns.isEmpty else { return nil }
+        Self.logger.notice("Composed \(turns.count, privacy: .public) turns, labeled: \(turns.contains { $0.speakerLabel != nil }, privacy: .public)")
         guard !Task.isCancelled else { return finalize(input, turns: turns, metadata: nil) }
 
+        let acousticallyLabeled = turns.contains { $0.speakerLabel != nil }
         turns = await cleanUp(turns: turns)
-        guard !Task.isCancelled else { return finalize(input, turns: turns, metadata: nil) }
+        guard !Task.isCancelled else {
+            Self.logger.notice("Enhancement cancelled after cleanup stage")
+            return finalize(input, turns: turns, metadata: nil)
+        }
+
+        if !acousticallyLabeled {
+            turns = await inferSpeakerLabels(turns: turns)
+            guard !Task.isCancelled else {
+                return finalize(input, turns: turns, metadata: nil)
+            }
+        }
 
         let metadata = await generateMetadata(for: turns, chunks: input.chunks)
         return finalize(input, turns: turns, metadata: metadata)
@@ -150,18 +174,39 @@ final class TranscriptEnhancer: Sendable {
 
     // MARK: - Stage C: text cleanup
 
-    @Generable
-    fileprivate struct CleanedText {
-        @Guide(description: "The corrected transcript text with the same meaning, wording, and paragraph breaks as the input")
-        var text: String
-    }
+    /// Transcripts of ordinary speech routinely trip the default safety
+    /// guardrails ("Detected content likely to be unsafe"). Apple's
+    /// sanctioned fix for transforming user-authored content is the
+    /// permissive-guardrails model — which only supports plain string
+    /// responses, not @Generable guided generation, so both LLM stages
+    /// use free-text prompting.
+    private static let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
 
     private static let cleanupInstructions = """
-        You clean up raw speech-to-text transcripts of lectures and meetings. \
-        Fix punctuation, capitalization, and clear transcription errors. \
+        You clean up raw speech-to-text transcripts of lectures, meetings, \
+        and technical discussions. Fix punctuation and capitalization. \
+        Speech recognizers often mishear words: when a word or phrase is \
+        clearly wrong for its context, replace it with what the speaker most \
+        likely said — for example, "Asians" in a software discussion is \
+        almost certainly "agents", and "hardest engineering" is likely \
+        "harness engineering". Prefer domain-appropriate technical terms. \
         Remove filler words and disfluencies such as "um", "uh", "you know", \
-        and repeated words. Do not change the meaning or add content. \
-        Preserve blank-line paragraph breaks.
+        and repeated words. Never summarize, drop sentences, or add new \
+        content. Preserve blank-line paragraph breaks. Respond with only the \
+        cleaned text, nothing else.
+        """
+
+    /// A single-task prompt labels far more reliably on the small on-device
+    /// model than folding labeling into the cleanup instructions did.
+    private static let labelingInstructions = """
+        You add speaker labels to transcripts of conversations such as \
+        interviews and podcasts. Work out from context where the speaker \
+        changes. Return the text exactly as given, word for word, with \
+        "Speaker 1: ", "Speaker 2: ", and so on inserted at the start of \
+        each speaker's turn. Start a new paragraph wherever the speaker \
+        changes mid-paragraph. Keep the numbering consistent with any labels \
+        in the context. If the whole text is one person speaking, return it \
+        exactly unchanged with no labels added.
         """
 
     /// Cleanup is transformation, not generation — sample near-greedily so
@@ -169,7 +214,10 @@ final class TranscriptEnhancer: Sendable {
     private static let cleanupOptions = GenerationOptions(temperature: 0.2)
 
     private func cleanUp(turns: [SpeakerTurn]) async -> [SpeakerTurn] {
-        guard case .available = SystemLanguageModel.default.availability else { return turns }
+        guard case .available = Self.model.availability else {
+            Self.logger.notice("Cleanup skipped, model unavailable: \(String(describing: Self.model.availability), privacy: .public)")
+            return turns
+        }
 
         var carriedContext = ""
         var cleaned: [SpeakerTurn] = []
@@ -225,6 +273,27 @@ final class TranscriptEnhancer: Sendable {
         max(1, text.count / 4)
     }
 
+    /// Fraction of output words that don't appear in the input — a cheap
+    /// order-insensitive measure of how much the model actually edited,
+    /// logged as evidence that cleanup is (or isn't) doing real work.
+    private static func wordChangeRatio(from original: String, to revised: String) -> Double {
+        guard original != revised else { return 0 }
+        var counts: [Substring: Int] = [:]
+        for word in original.split(whereSeparator: \.isWhitespace) {
+            counts[word, default: 0] += 1
+        }
+        let revisedWords = revised.split(whereSeparator: \.isWhitespace)
+        var unmatched = 0
+        for word in revisedWords {
+            if let count = counts[word], count > 0 {
+                counts[word] = count - 1
+            } else {
+                unmatched += 1
+            }
+        }
+        return Double(unmatched) / Double(max(revisedWords.count, 1))
+    }
+
     /// Cleans one batch, returning paragraphs. Falls back to the raw batch on
     /// any error; a context overflow is retried once as two halves.
     private func cleanBatch(
@@ -242,22 +311,20 @@ final class TranscriptEnhancer: Sendable {
 
         // A fresh session per batch: sessions accumulate their transcript,
         // and reuse would overflow the fixed context window.
-        let session = LanguageModelSession(instructions: Self.cleanupInstructions)
+        let session = LanguageModelSession(model: Self.model, instructions: Self.cleanupInstructions)
         if prewarm {
             session.prewarm()
         }
 
         do {
-            let response = try await session.respond(
-                to: prompt,
-                generating: CleanedText.self,
-                options: Self.cleanupOptions
-            )
-            let text = response.content.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let response = try await session.respond(to: prompt, options: Self.cleanupOptions)
+            let text = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
             // A wildly different length means the model summarized or padded.
             guard text.count >= joined.count * 2 / 5, text.count <= joined.count * 5 / 2 else {
+                Self.logger.notice("Cleanup batch rejected: \(joined.count, privacy: .public) chars in, \(text.count, privacy: .public) out")
                 return batch
             }
+            Self.logger.notice("Cleanup batch: \(joined.count, privacy: .public) chars in, \(text.count, privacy: .public) out, ~\(Int(Self.wordChangeRatio(from: joined, to: text) * 100), privacy: .public)% words changed")
             let paragraphs = text
                 .components(separatedBy: "\n\n")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -288,19 +355,72 @@ final class TranscriptEnhancer: Sendable {
         }
     }
 
-    // MARK: - Stage D: title
+    // MARK: - Stage C2: text-based speaker labeling
 
-    @Generable
-    fileprivate struct TranscriptMetadata {
-        @Guide(description: "A 3 to 8 word noun phrase naming the specific topic discussed, using only letters, digits, spaces, and hyphens")
-        var title: String
+    /// Fallback when acoustic diarization heard a single voice: let the model
+    /// infer speaker turns from conversational context. Labels are inserted
+    /// as literal text; a batch is rejected outright if the model changed
+    /// the words rather than only inserting labels.
+    private func inferSpeakerLabels(turns: [SpeakerTurn]) async -> [SpeakerTurn] {
+        guard case .available = Self.model.availability else { return turns }
+
+        let paragraphs = turns.flatMap(\.paragraphs)
+        guard !paragraphs.isEmpty else { return turns }
+
+        var labeled: [String] = []
+        var carriedContext = ""
+        for batch in batches(of: paragraphs) {
+            if Task.isCancelled {
+                labeled.append(contentsOf: batch)
+                continue
+            }
+            let joined = batch.joined(separator: "\n\n")
+            var prompt = ""
+            if !carriedContext.isEmpty {
+                prompt += "Labeled context from the preceding transcript (do not repeat it):\n…\(carriedContext)\n\n"
+            }
+            prompt += "Add speaker labels to this transcript excerpt:\n\n\(joined)"
+
+            let session = LanguageModelSession(model: Self.model, instructions: Self.labelingInstructions)
+            do {
+                let response = try await session.respond(to: prompt, options: Self.cleanupOptions)
+                let text = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                let withoutLabels = text.replacingOccurrences(
+                    of: #"Speaker \d+:\s*"#,
+                    with: "",
+                    options: .regularExpression
+                )
+                if Self.wordChangeRatio(from: joined, to: withoutLabels) <= 0.05 {
+                    labeled.append(contentsOf: text
+                        .components(separatedBy: "\n\n")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty })
+                } else {
+                    Self.logger.notice("Speaker inference batch rejected: model rewrote the text")
+                    labeled.append(contentsOf: batch)
+                }
+            } catch {
+                Self.logger.notice("Speaker inference batch kept unlabeled: \(error.localizedDescription, privacy: .public)")
+                labeled.append(contentsOf: batch)
+            }
+            carriedContext = String(labeled.joined(separator: "\n\n").suffix(Self.carriedContextLength))
+        }
+
+        let didLabel = labeled.contains { $0.hasPrefix("Speaker ") }
+        Self.logger.notice("Speaker inference labeled: \(didLabel, privacy: .public)")
+        return [SpeakerTurn(speakerLabel: nil, paragraphs: labeled)]
     }
+
+    // MARK: - Stage D: title
 
     private func generateMetadata(
         for turns: [SpeakerTurn],
         chunks: [TimedTranscriptChunk]
-    ) async -> TranscriptMetadata? {
-        guard case .available = SystemLanguageModel.default.availability else { return nil }
+    ) async -> String? {
+        guard case .available = Self.model.availability else {
+            Self.logger.notice("Title skipped, model unavailable: \(String(describing: Self.model.availability), privacy: .public)")
+            return nil
+        }
 
         let body = turns.flatMap(\.paragraphs).joined(separator: "\n\n")
         guard !body.isEmpty else { return nil }
@@ -320,7 +440,9 @@ final class TranscriptEnhancer: Sendable {
         let prompt = """
             Name this transcript of a recorded lecture or meeting, based on \
             these excerpts. Name the specific subject matter; avoid generic \
-            titles such as "Meeting Recording", "Lecture", or "Discussion".
+            titles such as "Meeting Recording", "Lecture", or "Discussion". \
+            Respond with only the title: a 3 to 8 word noun phrase using \
+            only letters, digits, spaces, and hyphens.
 
             Beginning:
             \(beginning)
@@ -328,11 +450,18 @@ final class TranscriptEnhancer: Sendable {
             Middle:
             \(middle)
             """
-        let session = LanguageModelSession()
+        let session = LanguageModelSession(model: Self.model)
         do {
-            return try await session.respond(to: prompt, generating: TranscriptMetadata.self).content
+            let response = try await session.respond(to: prompt)
+            // Free-text models pad despite instructions; keep the first
+            // non-empty line and let sanitizedTitle handle the rest.
+            let title = response.content
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \"'.“”")) }
+                .first { !$0.isEmpty }
+            return title
         } catch {
-            Self.logger.notice("Metadata generation skipped: \(error.localizedDescription)")
+            Self.logger.notice("Metadata generation skipped: \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }
@@ -354,7 +483,7 @@ final class TranscriptEnhancer: Sendable {
     private func finalize(
         _ input: EnhancementInput,
         turns: [SpeakerTurn],
-        metadata: TranscriptMetadata?
+        metadata: String?
     ) -> Transcript? {
         let body = TranscriptComposer.renderBody(turns)
         guard !body.isEmpty else { return nil }
@@ -363,6 +492,7 @@ final class TranscriptEnhancer: Sendable {
         // would be byte-equivalent to the raw file; leave the raw file alone.
         let isLabeled = turns.contains { $0.speakerLabel != nil }
         if metadata == nil, !isLabeled, body == input.rawText {
+            Self.logger.notice("Nothing to persist: no labels, no title, text unchanged")
             return nil
         }
 
@@ -370,7 +500,7 @@ final class TranscriptEnhancer: Sendable {
             return try TranscriptStore.finalizeEnhanced(
                 raw: input.raw,
                 body: body,
-                title: metadata?.title,
+                title: metadata,
                 recordedAt: input.recordedAt
             )
         } catch {

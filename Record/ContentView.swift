@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @State private var controller = RecordingController()
@@ -186,6 +187,9 @@ struct TranscriptDetailView: View {
         .navigationTitle(transcript.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            Button("Copy", systemImage: "doc.on.doc") {
+                UIPasteboard.general.string = bodyText
+            }
             Button("Rename", systemImage: "pencil") {
                 renameText = transcript.title
                 showingRename = true

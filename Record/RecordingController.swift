@@ -239,7 +239,9 @@ final class RecordingController {
             locale: locale,
             transcriptionOptions: [],
             reportingOptions: [.volatileResults],
-            attributeOptions: []
+            // Word-level audio time ranges let speaker attribution split a
+            // recognition chunk at the exact moment the voice changes.
+            attributeOptions: [.audioTimeRange]
         )
         if let installationRequest = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
             state = .downloadingModel
@@ -282,12 +284,12 @@ final class RecordingController {
                         if !trimmed.isEmpty {
                             self.forceParagraphBreak = false
                             self.lastFinalizedResultEnd = CMTimeRangeGetEnd(result.range)
-                            self.finalizedChunks.append(TimedTranscriptChunk(
-                                text: trimmed,
-                                start: CMTimeGetSeconds(result.range.start),
-                                end: CMTimeGetSeconds(CMTimeRangeGetEnd(result.range)),
+                            self.appendFinalizedChunks(
+                                from: result.text,
+                                resultRange: result.range,
+                                fallbackText: trimmed,
                                 startsNewParagraph: startsNewParagraph
-                            ))
+                            )
                         }
                         try? journal?.saveCheckpoint(self.finalizedText)
                     } else {
@@ -554,6 +556,47 @@ final class RecordingController {
             return trimmed
         }
         return " " + trimmed
+    }
+
+    /// Captures alignment chunks from a finalized result, one per timed run
+    /// (roughly per word) so speaker attribution can split a recognition
+    /// chunk mid-way. Falls back to a single result-spanning chunk when the
+    /// result carries no run-level timing.
+    private func appendFinalizedChunks(
+        from attributed: AttributedString,
+        resultRange: CMTimeRange,
+        fallbackText: String,
+        startsNewParagraph: Bool
+    ) {
+        var runChunks: [TimedTranscriptChunk] = []
+        for run in attributed.runs {
+            guard let timeRange = run.audioTimeRange else { continue }
+            let runText = String(attributed[run.range].characters)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !runText.isEmpty else { continue }
+            runChunks.append(TimedTranscriptChunk(
+                text: runText,
+                start: CMTimeGetSeconds(timeRange.start),
+                end: CMTimeGetSeconds(CMTimeRangeGetEnd(timeRange)),
+                startsNewParagraph: runChunks.isEmpty && startsNewParagraph
+            ))
+        }
+
+        // The enhanced body is rebuilt from these chunks, so a run without
+        // timing would silently drop its words from the transcript. Only
+        // trust run-level capture when it reproduces the whole result.
+        let runsText = runChunks.map(\.text).joined().filter { !$0.isWhitespace }
+        let fullText = fallbackText.filter { !$0.isWhitespace }
+        if !runChunks.isEmpty, runsText == fullText {
+            finalizedChunks.append(contentsOf: runChunks)
+        } else {
+            finalizedChunks.append(TimedTranscriptChunk(
+                text: fallbackText,
+                start: CMTimeGetSeconds(resultRange.start),
+                end: CMTimeGetSeconds(CMTimeRangeGetEnd(resultRange)),
+                startsNewParagraph: startsNewParagraph
+            ))
+        }
     }
 
     /// Any volatile text remaining after finalization is included in the saved
