@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import Foundation
 import Speech
+import UIKit
 
 /// Drives the microphone -> SpeechAnalyzer pipeline and exposes live transcript text.
 ///
@@ -16,7 +17,9 @@ final class RecordingController {
         case downloadingModel
         case recovering
         case recording
+        case paused
         case stopping
+        case enhancing
     }
 
     private(set) var state: State = .idle
@@ -24,6 +27,7 @@ final class RecordingController {
     private(set) var volatileText: String = ""
     var errorMessage: String?
     private(set) var lastSavedTranscript: Transcript?
+    private(set) var enhancementProgress: Double?
 
     private let audioEngine = AVAudioEngine()
     private let converter = BufferConverter()
@@ -39,12 +43,22 @@ final class RecordingController {
     private var tapInstalled = false
     private var analysisFailure: Error?
     private var lastFinalizedResultEnd: CMTime?
+    private var forceParagraphBreak = false
+
+    /// Finalized chunks with analyzer-timeline positions, kept in memory for
+    /// speaker alignment during the enhancement pass. If the process dies
+    /// before enhancement, the raw unlabeled transcript is the fallback.
+    private var finalizedChunks: [TimedTranscriptChunk] = []
+
+    private let enhancer = TranscriptEnhancer()
+    private var enhancementTask: Task<Transcript?, Never>?
 
     private static let strongParagraphPause: TimeInterval = 2.0
     private static let contextualParagraphPause: TimeInterval = 1.25
     private static let minimumContextualParagraphLength = 200
 
     var isRecording: Bool { state == .recording }
+    var isSessionActive: Bool { state == .recording || state == .paused }
     var liveTranscript: String { finalizedText + volatileText }
 
     init() {
@@ -70,10 +84,37 @@ final class RecordingController {
         switch state {
         case .idle:
             Task { await startRecording() }
-        case .recording:
+        case .recording, .paused:
             Task { await stopRecording() }
         default:
             break
+        }
+    }
+
+    /// Pausing stops pulling microphone buffers while keeping the analyzer,
+    /// journal, and audio session open. No audio flows, so the analyzer and
+    /// journal timelines simply do not advance — they stay continuous and
+    /// aligned for later diarization, no matter how long the pause lasts.
+    func pauseRecording() {
+        guard state == .recording else { return }
+        audioEngine.pause()
+        state = .paused
+    }
+
+    func resumeRecording() {
+        guard state == .paused else { return }
+        do {
+            try audioEngine.start()
+            // The seam is invisible on the audio timeline, so the pause
+            // heuristics can't produce the paragraph break a reader expects.
+            forceParagraphBreak = true
+            state = .recording
+        } catch {
+            Task {
+                await stopRecording(
+                    notice: "Recording stopped because the microphone could not be resumed. Everything captured before the pause was saved. \(error.localizedDescription)"
+                )
+            }
         }
     }
 
@@ -83,12 +124,20 @@ final class RecordingController {
         guard state == .idle else { return }
 
         for pendingJournal in RecordingJournal.pending() {
+            // A journal whose transcript already reached Documents was only
+            // waiting on the enhancement pass when the app died. Recovering
+            // it again would save a duplicate.
+            if pendingJournal.hasSavedTranscript {
+                try? pendingJournal.remove()
+                continue
+            }
             state = .recovering
             errorMessage = nil
             finalizedText = ""
             volatileText = ""
             analysisFailure = nil
             lastFinalizedResultEnd = nil
+            finalizedChunks = []
 
             let checkpoint = pendingJournal.loadCheckpoint()
             do {
@@ -98,8 +147,18 @@ final class RecordingController {
                 guard !text.isEmpty else {
                     throw RecordingError.noRecoverableSpeech
                 }
-                lastSavedTranscript = try TranscriptStore.save(text, date: pendingJournal.startedAt)
-                try pendingJournal.remove()
+                let raw = try TranscriptStore.save(text, date: pendingJournal.startedAt)
+                lastSavedTranscript = raw
+                try? pendingJournal.markTranscriptSaved()
+                // When the checkpoint text won, it doesn't match the re-run's
+                // chunks, so speaker alignment would mislabel it. Skip labels.
+                let chunksForAlignment = recovered.count >= checkpoint.count ? finalizedChunks : []
+                await runEnhancement(
+                    raw: raw,
+                    rawText: text,
+                    chunks: chunksForAlignment,
+                    journal: pendingJournal
+                )
             } catch {
                 // A finalized checkpoint is still useful even if the last audio segment
                 // was damaged. Keep the journal so a future launch can retry recovery.
@@ -129,6 +188,8 @@ final class RecordingController {
         lastSavedTranscript = nil
         analysisFailure = nil
         lastFinalizedResultEnd = nil
+        finalizedChunks = []
+        forceParagraphBreak = false
 
         do {
             guard await AVAudioApplication.requestRecordPermission() else {
@@ -207,15 +268,26 @@ final class RecordingController {
             do {
                 for try await result in transcriber.results {
                     guard let self else { return }
+                    let trimmed = String(result.text.characters)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let startsNewParagraph = !self.finalizedText.isEmpty
+                        && (self.forceParagraphBreak || self.shouldStartNewParagraph(for: result.range))
                     let text = self.formattedTranscriptionChunk(
-                        String(result.text.characters),
-                        range: result.range
+                        trimmed,
+                        startsNewParagraph: startsNewParagraph
                     )
                     if result.isFinal {
                         self.finalizedText += text
                         self.volatileText = ""
-                        if !text.isEmpty {
+                        if !trimmed.isEmpty {
+                            self.forceParagraphBreak = false
                             self.lastFinalizedResultEnd = CMTimeRangeGetEnd(result.range)
+                            self.finalizedChunks.append(TimedTranscriptChunk(
+                                text: trimmed,
+                                start: CMTimeGetSeconds(result.range.start),
+                                end: CMTimeGetSeconds(CMTimeRangeGetEnd(result.range)),
+                                startsNewParagraph: startsNewParagraph
+                            ))
                         }
                         try? journal?.saveCheckpoint(self.finalizedText)
                     } else {
@@ -262,7 +334,7 @@ final class RecordingController {
     // MARK: - Stop and interruptions
 
     private func stopRecording(notice: String? = nil) async {
-        guard state == .recording else { return }
+        guard state == .recording || state == .paused else { return }
         state = .stopping
 
         stopAudioEngine()
@@ -285,6 +357,7 @@ final class RecordingController {
             finalizeFailure = error
         }
         await resultsTask?.value
+        captureTrailingVolatileChunk()
 
         let text = (finalizedText + volatileText).trimmingCharacters(in: .whitespacesAndNewlines)
         let currentJournal = journal
@@ -315,13 +388,20 @@ final class RecordingController {
         }
 
         do {
-            lastSavedTranscript = try TranscriptStore.save(text, date: currentJournal?.startedAt ?? .now)
-            try currentJournal?.remove()
+            let raw = try TranscriptStore.save(text, date: currentJournal?.startedAt ?? .now)
+            lastSavedTranscript = raw
+            try? currentJournal?.markTranscriptSaved()
             if let writerFailure {
                 errorMessage = "The transcript was saved, but part of the temporary recovery audio could not be written. \(writerFailure.localizedDescription)"
             } else if let notice {
                 errorMessage = notice
             }
+            await runEnhancement(
+                raw: raw,
+                rawText: text,
+                chunks: finalizedChunks,
+                journal: currentJournal
+            )
         } catch {
             errorMessage = "Could not save the transcript. Temporary recovery data was kept. \(error.localizedDescription)"
         }
@@ -329,9 +409,70 @@ final class RecordingController {
         state = .idle
     }
 
+    // MARK: - Enhancement
+
+    /// Best-effort post-processing after the raw transcript is durable:
+    /// diarization, cleanup, and metadata via TranscriptEnhancer. The journal
+    /// is deleted here — as soon as its audio has been consumed — instead of
+    /// at save time.
+    private func runEnhancement(
+        raw: Transcript,
+        rawText: String,
+        chunks: [TimedTranscriptChunk],
+        journal: RecordingJournal?
+    ) async {
+        state = .enhancing
+        enhancementProgress = nil
+
+        // Recording no longer holds the audio session, so request the short
+        // grace period iOS grants for finishing work after backgrounding. If
+        // it expires, the raw transcript is already saved and the marker
+        // makes the leftover journal safe to delete on the next launch.
+        let backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "TranscriptEnhancement") { [weak self] in
+            self?.enhancementTask?.cancel()
+        }
+        defer {
+            if backgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTask)
+            }
+        }
+
+        let input = EnhancementInput(
+            raw: raw,
+            rawText: rawText,
+            chunks: chunks,
+            audioSegmentURLs: journal?.audioSegmentURLs() ?? [],
+            scratchDirectory: journal?.scratchDirectory,
+            recordedAt: journal?.startedAt ?? raw.date
+        )
+        let enhancer = self.enhancer
+        let task = Task.detached(priority: .userInitiated) {
+            await enhancer.enhance(input) {
+                try? journal?.remove()
+            } progress: { value in
+                Task { @MainActor [weak self] in
+                    self?.enhancementProgress = value
+                }
+            }
+        }
+        enhancementTask = task
+
+        if let enhanced = await task.value {
+            lastSavedTranscript = enhanced
+        }
+        enhancementTask = nil
+        enhancementProgress = nil
+
+        // Cancellation can end the pass before it reaches the deletion
+        // callback; the transcript is saved, so the journal must not linger.
+        if let journal, FileManager.default.fileExists(atPath: journal.directory.path) {
+            try? journal.remove()
+        }
+    }
+
     private func handleAudioInterruption(_ notification: Notification) async {
         guard
-            state == .recording,
+            state == .recording || state == .paused,
             let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
             AVAudioSession.InterruptionType(rawValue: typeValue) == .began
         else {
@@ -343,7 +484,7 @@ final class RecordingController {
     }
 
     private func handleEngineConfigurationChange() async {
-        guard state == .recording else { return }
+        guard state == .recording || state == .paused else { return }
         await stopRecording(
             notice: "Recording stopped safely because the microphone or audio route changed. Everything captured before the change was saved."
         )
@@ -399,12 +540,11 @@ final class RecordingController {
     /// SpeechTranscriber returns recognition chunks rather than semantic
     /// paragraphs. Use timing, punctuation, and paragraph length to create
     /// stable, readable boundaries without requiring a second model.
-    private func formattedTranscriptionChunk(_ text: String, range: CMTimeRange) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func formattedTranscriptionChunk(_ trimmed: String, startsNewParagraph: Bool) -> String {
         guard !trimmed.isEmpty else { return "" }
         guard !finalizedText.isEmpty else { return trimmed }
 
-        if shouldStartNewParagraph(for: range) {
+        if startsNewParagraph {
             return "\n\n" + trimmed
         }
 
@@ -414,6 +554,21 @@ final class RecordingController {
             return trimmed
         }
         return " " + trimmed
+    }
+
+    /// Any volatile text remaining after finalization is included in the saved
+    /// transcript, so it also needs a chunk for speaker alignment. A zero-length
+    /// range at the end of the timeline makes it inherit the last speaker.
+    private func captureTrailingVolatileChunk() {
+        let trailing = volatileText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trailing.isEmpty else { return }
+        let anchor = lastFinalizedResultEnd.map(CMTimeGetSeconds) ?? 0
+        finalizedChunks.append(TimedTranscriptChunk(
+            text: trailing,
+            start: anchor,
+            end: anchor,
+            startsNewParagraph: false
+        ))
     }
 
     private func shouldStartNewParagraph(for range: CMTimeRange) -> Bool {
@@ -452,6 +607,8 @@ final class RecordingController {
         volatileText = ""
         analysisFailure = nil
         lastFinalizedResultEnd = nil
+        finalizedChunks = []
+        forceParagraphBreak = false
         converter.reset()
         startResultsTask(for: transcriber, checkpointing: nil)
 
@@ -496,6 +653,7 @@ final class RecordingController {
         if let analysisFailure {
             throw analysisFailure
         }
+        captureTrailingVolatileChunk()
         return (finalizedText + volatileText).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -9,10 +9,12 @@ The app keeps the transcript, not the source recording. Audio is journaled tempo
 - Record and transcribe microphone audio entirely on the iPhone.
 - Support long sessions without an app-imposed recording limit. Practical limits are available storage, battery life, and iOS resource management.
 - Continue recording while the screen is locked or the app is in the background.
+- Allow pausing and resuming an active session.
 - Show finalized and in-progress transcription while the app is visible.
 - Save completed transcripts as plain text files.
+- After each recording, clean up the transcript text, generate a title, and label speakers in multi-speaker recordings — all on-device and best-effort, never at the expense of the raw transcript.
 - Preserve useful work when recording is interrupted, the audio route changes, or the app terminates unexpectedly.
-- Retain raw audio only while it is required for in-progress recovery.
+- Retain raw audio only while it is required for in-progress recovery and post-recording speaker analysis.
 - Make transcripts available in the app, the Files app, and the iOS share sheet.
 
 ## What is implemented
@@ -31,7 +33,21 @@ Transcription does not require a network connection after the device has the app
 - a pause of at least 1.25 seconds starts a new paragraph when the previous sentence is complete and the current paragraph is already at least 200 characters; and
 - shorter pauses join chunks with normal sentence spacing.
 
-The formatting runs live and during crash recovery, entirely on-device. These are presentation heuristics rather than topic detection, and the API does not currently provide speaker diarization.
+The formatting runs live and during crash recovery, entirely on-device. These are presentation heuristics rather than topic detection; speaker labels and semantic cleanup are added afterward by the enhancement pass described below.
+
+### Post-recording enhancement pass
+
+After a transcript is saved (or recovered), Record runs a best-effort enhancement pass, entirely on-device:
+
+1. **Speaker diarization** — the journaled audio is analyzed with [FluidAudio](https://github.com/FluidInference/FluidAudio) CoreML models. When more than one substantial speaker is detected (at least 5% of talk time and 10 seconds each), paragraphs are prefixed with `Speaker 1:`, `Speaker 2:`, and so on. Single-speaker recordings such as lectures stay unlabeled. The first run downloads the diarization models (about 100 MB, cached afterward).
+2. **Text cleanup** — on Apple Intelligence devices, the on-device Foundation Models LLM fixes punctuation, casing, and obvious mis-transcriptions and removes filler words, processing the transcript in small batches. Batches the model cannot improve are kept verbatim.
+3. **Title** — one guided-generation call names the file after the specific topic discussed.
+
+Every stage degrades independently: if diarization fails there are no speaker labels, if the language model is unavailable the text stays raw, and if title generation fails the date-based filename is kept. The raw transcript is durable on disk before the pass begins, and the pre-enhancement original remains viewable from the transcript detail screen. New recordings are disabled while a pass is running (typically one to two minutes for an hour-long session, with progress shown).
+
+### Pause and resume
+
+Recording can be paused and resumed from the recording screen. Pausing stops pulling microphone audio while keeping the session open; the pause consumes no storage, and the analyzer and journal timelines stay continuous so speaker attribution is unaffected. The transcript starts a new paragraph at the resume point. A system interruption (such as a phone call) while paused ends the session safely, exactly as it does while recording.
 
 ### Long recordings and background operation
 
@@ -47,9 +63,10 @@ Segmenting limits the amount of audio at risk if the process is terminated while
 
 ### Stop, interruption, and recovery behavior
 
-- Normal stop finalizes the analyzer, saves a `.txt` transcript, and deletes the temporary audio journal.
+- Normal stop finalizes the analyzer and saves a `.txt` transcript before anything else happens. The temporary audio journal is deleted as soon as the enhancement pass has read it for speaker analysis (immediately, if diarization is skipped).
+- A `transcript-saved` marker is written to the journal the moment the transcript reaches Documents. If the app dies during the enhancement pass, the next launch discards the marked journal instead of recovering it into a duplicate transcript.
 - Phone calls, system audio interruptions, microphone changes, and audio-route changes stop the session safely and save the portion captured before the interruption.
-- On launch, any journal left by a crash or force-quit is transcribed again. The recovered transcript is saved and the temporary audio is deleted.
+- On launch, any unmarked journal left by a crash or force-quit is transcribed again. The recovered transcript is saved, enhanced, and the temporary audio is deleted.
 - If full recovery is not possible, the finalized text checkpoint is saved when available and the temporary journal remains for another recovery attempt.
 - Raw audio is not exposed in Documents and is not retained after a successful transcript save.
 
@@ -57,25 +74,34 @@ An interruption ends the current recording rather than resuming it automatically
 
 ### Transcript storage
 
-Transcripts are named `Recording YYYY-MM-DD at HH.mm.ss.txt` and stored in the app's Documents directory. They can be:
+Transcripts are stored in the app's Documents directory as pure plain text. A transcript is first saved as `Recording YYYY-MM-DD at HH.mm.ss.txt`; when the enhancement pass generates a title, the file is renamed to `<Title> — YYYY-MM-DD HH.mm.txt`, keeping the timestamp for uniqueness and sorting.
 
-- opened and deleted inside Record;
+Transcripts can be:
+
+- opened, renamed, and deleted inside Record;
 - shared from the transcript detail screen; or
 - accessed under **On My iPhone → Record** in the Files app.
 
+The pre-enhancement original is kept privately in Application Support, is viewable via **View original** in the detail screen, and is deleted together with its transcript.
+
 ## Project layout
 
-- `Record/RecordingController.swift` — recording lifecycle, speech analysis, interruptions, and recovery.
-- `Record/RecordingJournal.swift` — temporary manifest, transcript checkpoint, and segmented CAF writer.
+- `Record/RecordingController.swift` — recording lifecycle, pause/resume, speech analysis, interruptions, recovery, and enhancement orchestration.
+- `Record/RecordingJournal.swift` — temporary manifest, transcript checkpoint, saved-transcript marker, and segmented CAF writer.
 - `Record/BufferConverter.swift` — microphone-to-analyzer audio conversion.
-- `Record/TranscriptStore.swift` — durable plain-text transcript storage.
+- `Record/TimedTranscript.swift` — timed transcript chunks and speaker-attribution logic.
+- `Record/TranscriptEnhancer.swift` — diarization, LLM text cleanup, and title generation.
+- `Record/TranscriptStore.swift` — durable transcript storage, renaming, and pre-enhancement originals.
 - `Record/ContentView.swift` — recording UI, recovery state, transcript list, sharing, and deletion.
 - `Record/Info.plist` — microphone permission, Files integration, and audio background mode.
+
+The project has one Swift package dependency, [FluidAudio](https://github.com/FluidInference/FluidAudio), for on-device speaker diarization. The first build needs network access to resolve it.
 
 ## Requirements
 
 - Xcode 26 or later.
 - A physical iPhone running iOS 26 or later. The on-device speech models are not available in the Simulator.
+- An Apple Intelligence-capable iPhone with Apple Intelligence enabled for transcript cleanup and title generation. Without it, those stages are skipped silently; recording, transcription, and speaker labeling still work.
 - An Apple signing team. A free Personal Team is sufficient for installing on your own iPhone, though Personal Team builds generally need to be reinstalled after their provisioning period expires.
 
 ## Deployment
@@ -173,13 +199,19 @@ Run these checks on a physical iPhone:
 3. Start another recording, speak long enough to produce visible text, then force-quit Record. Reopen it and wait for recovery to finish. Confirm a transcript appears.
 4. Open the recovered transcript, use Share, and verify the same file appears in **Files → On My iPhone → Record**.
 5. Delete an unneeded transcript from the list and confirm it disappears from Files.
+6. Record a short solo memo online and wait for **Enhancing transcript…** to finish. Confirm the file is renamed to a topic, has no speaker labels, and offers **View original** in the detail screen. Rename it and confirm the new name appears in Files and **View original** still works.
+7. Record a few minutes of two people conversing. Confirm the enhanced transcript labels turns with `Speaker 1:` and `Speaker 2:`.
+8. Start a recording, tap pause, speak (the transcript must not grow), tap resume, speak again, and stop. Confirm the post-resume speech begins a new paragraph.
+9. Force-quit the app while **Enhancing transcript…** is showing. Relaunch and confirm exactly one transcript exists for that recording (unenhanced) and no recovery pass runs for it.
 
 For an hour-plus lecture, begin with a charged device and sufficient free storage. Temporary uncompressed PCM audio is stored for the duration of the session and removed only after the transcript is safely saved.
 
 ## Privacy and limitations
 
-- Speech analysis is on-device. No recording or transcript is uploaded by this app.
-- iOS may use the network to download a required speech model.
+- Speech analysis, speaker diarization, transcript cleanup, and title generation are all on-device. No recording or transcript is uploaded by this app.
+- iOS may use the network to download a required speech model, and the first enhancement pass downloads speaker-diarization models (about 100 MB). Only models are downloaded; no audio or text is sent.
+- Transcript cleanup and metadata generation require an Apple Intelligence device and are skipped otherwise; the transcript is then kept exactly as transcribed.
+- The enhancement pass may be cut short if the app is backgrounded right after a long recording stops; the saved transcript is never at risk, it just stays unenhanced.
 - Calls and other microphone interruptions end the active session after saving its captured portion.
 - Force-quitting prevents any further background capture; audio recorded before termination is recovered on the next launch.
 - Recovery protects against interrupted sessions, but no mobile app can guarantee capture after iOS terminates it, storage is exhausted, or the device loses power.

@@ -19,6 +19,12 @@ struct RecordingJournal: Sendable {
 
     private var manifestURL: URL { directory.appendingPathComponent("manifest.json") }
     private var checkpointURL: URL { directory.appendingPathComponent("transcript.txt") }
+    private var savedMarkerURL: URL { directory.appendingPathComponent("transcript-saved") }
+
+    /// Scratch space for the enhancement pass (for example concatenated
+    /// diarization audio). Kept in a subdirectory so `audioSegmentURLs()`'s
+    /// non-recursive listing never mistakes scratch files for segments.
+    var scratchDirectory: URL { directory.appendingPathComponent("tmp", isDirectory: true) }
 
     static func create(date: Date = .now) throws -> RecordingJournal {
         try FileManager.default.createDirectory(
@@ -71,6 +77,18 @@ struct RecordingJournal: Sendable {
 
     func loadCheckpoint() -> String {
         (try? String(contentsOf: checkpointURL, encoding: .utf8)) ?? ""
+    }
+
+    /// Records that this journal's transcript reached Documents. Journal
+    /// removal is deferred until the enhancement pass has read the audio, so
+    /// without this marker a termination during that window would make the
+    /// next launch recover the journal into a duplicate transcript.
+    func markTranscriptSaved() throws {
+        try Data().write(to: savedMarkerURL, options: .atomic)
+    }
+
+    var hasSavedTranscript: Bool {
+        FileManager.default.fileExists(atPath: savedMarkerURL.path)
     }
 
     func audioSegmentURLs() -> [URL] {

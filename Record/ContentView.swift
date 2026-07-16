@@ -68,7 +68,9 @@ struct ContentView: View {
                 }
                 .navigationDestination(for: URL.self) { url in
                     if let transcript = transcripts.first(where: { $0.url == url }) {
-                        TranscriptDetailView(transcript: transcript)
+                        TranscriptDetailView(transcript: transcript) {
+                            transcripts = TranscriptStore.list()
+                        }
                     }
                 }
             }
@@ -100,8 +102,18 @@ struct ContentView: View {
             case .recording:
                 Label("Listening", systemImage: "waveform")
                     .symbolEffect(.variableColor.iterative)
+            case .paused:
+                Label("Paused", systemImage: "pause.fill")
             case .stopping:
                 Label("Finishing up…", systemImage: "hourglass")
+            case .enhancing:
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Enhancing transcript…", systemImage: "sparkles")
+                        .symbolEffect(.pulse)
+                    if let progress = controller.enhancementProgress {
+                        ProgressView(value: progress)
+                    }
+                }
             case .idle:
                 EmptyView()
             }
@@ -111,33 +123,62 @@ struct ContentView: View {
     }
 
     private var recordButton: some View {
-        Button {
-            controller.toggleRecording()
-        } label: {
-            Image(systemName: controller.isRecording ? "stop.fill" : "mic.fill")
-                .font(.title)
-                .frame(width: 72, height: 72)
-                .background(controller.isRecording ? Color.red : Color.accentColor, in: Circle())
-                .foregroundStyle(.white)
+        HStack(spacing: 24) {
+            if controller.isSessionActive {
+                Button {
+                    if controller.state == .paused {
+                        controller.resumeRecording()
+                    } else {
+                        controller.pauseRecording()
+                    }
+                } label: {
+                    Image(systemName: controller.state == .paused ? "play.fill" : "pause.fill")
+                        .font(.title2)
+                        .frame(width: 56, height: 56)
+                        .background(.thinMaterial, in: Circle())
+                }
+                .accessibilityLabel(controller.state == .paused ? "Resume recording" : "Pause recording")
+            }
+
+            Button {
+                controller.toggleRecording()
+            } label: {
+                Image(systemName: controller.isSessionActive ? "stop.fill" : "mic.fill")
+                    .font(.title)
+                    .frame(width: 72, height: 72)
+                    .background(controller.isSessionActive ? Color.red : Color.accentColor, in: Circle())
+                    .foregroundStyle(.white)
+            }
+            .disabled(
+                controller.state == .preparing
+                    || controller.state == .downloadingModel
+                    || controller.state == .recovering
+                    || controller.state == .stopping
+                    || controller.state == .enhancing
+            )
+            .accessibilityLabel(controller.isSessionActive ? "Stop recording" : "Start recording")
         }
-        .disabled(
-            controller.state == .preparing
-                || controller.state == .downloadingModel
-                || controller.state == .recovering
-                || controller.state == .stopping
-        )
         .padding(.bottom, 8)
-        .accessibilityLabel(controller.isRecording ? "Stop recording" : "Start recording")
     }
 }
 
 struct TranscriptDetailView: View {
-    let transcript: Transcript
-    @State private var text = ""
+    @State private var transcript: Transcript
+    private let onUpdate: () -> Void
+    @State private var bodyText = ""
+    @State private var showingOriginal = false
+    @State private var showingRename = false
+    @State private var renameText = ""
+    @State private var renameErrorMessage: String?
+
+    init(transcript: Transcript, onUpdate: @escaping () -> Void) {
+        _transcript = State(initialValue: transcript)
+        self.onUpdate = onUpdate
+    }
 
     var body: some View {
         ScrollView {
-            Text(text)
+            Text(bodyText)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
                 .textSelection(.enabled)
@@ -145,9 +186,56 @@ struct TranscriptDetailView: View {
         .navigationTitle(transcript.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            Button("Rename", systemImage: "pencil") {
+                renameText = transcript.title
+                showingRename = true
+            }
+            if transcript.hasOriginal {
+                Button("View original", systemImage: "doc.text.magnifyingglass") {
+                    showingOriginal = true
+                }
+            }
             ShareLink(item: transcript.url)
         }
-        .task { text = TranscriptStore.load(transcript) }
+        .alert("Rename Transcript", isPresented: $showingRename) {
+            TextField("Title", text: $renameText)
+            Button("Rename") {
+                do {
+                    transcript = try TranscriptStore.rename(transcript, to: renameText)
+                    onUpdate()
+                } catch {
+                    renameErrorMessage = error.localizedDescription
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .alert(
+            "Couldn't Rename",
+            isPresented: Binding(
+                get: { renameErrorMessage != nil },
+                set: { if !$0 { renameErrorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(renameErrorMessage ?? "")
+        }
+        .sheet(isPresented: $showingOriginal) {
+            NavigationStack {
+                ScrollView {
+                    Text(TranscriptStore.loadOriginal(transcript) ?? "")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                        .textSelection(.enabled)
+                }
+                .navigationTitle("Original transcript")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    Button("Done") { showingOriginal = false }
+                }
+            }
+        }
+        .task { bodyText = TranscriptStore.load(transcript) }
     }
 }
 
