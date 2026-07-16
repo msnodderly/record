@@ -7,6 +7,7 @@ Connect your iPhone with iOS 26+ to your Mac running MacOS 15.7+, point your fav
 
 Good luck! -Matt
 
+<img width="330"  alt="IMG_6749" src="https://github.com/user-attachments/assets/b8b99ad8-f753-49c4-9bad-9d73fba4e719" />
 
 
 ## Features
