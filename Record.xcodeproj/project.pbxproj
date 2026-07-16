@@ -78,6 +78,7 @@
 			);
 			name = Record;
 			packageProductDependencies = (
+				A100000000000000000000A3 /* FluidAudio */,
 			);
 			productName = Record;
 			productReference = A100000000000000000000A1 /* Record.app */;
@@ -111,6 +112,9 @@
 			productRefGroup = A100000000000000000000F2 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
+			packageReferences = (
+				A100000000000000000000A2 /* XCRemoteSwiftPackageReference "FluidAudio" */,
+			);
 			targets = (
 				A100000000000000000000D1 /* Record */,
 			);
@@ -310,6 +314,25 @@
 			name = Release;
 		};
 /* End XCBuildConfiguration section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A100000000000000000000A2 /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/FluidInference/FluidAudio.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.15.5;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A100000000000000000000A3 /* FluidAudio */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A100000000000000000000A2 /* XCRemoteSwiftPackageReference "FluidAudio" */;
+			productName = FluidAudio;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCConfigurationList section */
 		A100000000000000000000D2 /* Build configuration list for PBXNativeTarget "Record" */ = {
