@@ -1,7 +1,7 @@
 # Record
-I just wanted to take notes by talking to my iPhone. This is a super-simple 100% on-device iPhone transcription app. Transcribes audio, cleans it up, lets you copy or share the text.
+I just wanted to take notes by talking to my iPhone. This is a super-simple 100% on-device iPhone transcription app. So simple it doesn't even have a name. 
 
-Feel free to use it.
+Transcribes audio, cleans it up, lets you copy or share the text. That's it.
 
 Connect your iPhone with iOS 26+ to your Mac running MacOS 15.7+, point your favorite AI agent at this README.md and tell it to figure out how to build and install it for you. 
 
