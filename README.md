@@ -1,21 +1,20 @@
 # Record
 
-Record is a small iPhone app for long-form, on-device transcription. It is designed for lectures and other recordings lasting an hour or more, including sessions where the screen is locked.
+Super-simple 100% on-device iPhone transcription app. Transcribes audio, cleans it up, lets you copy or share the text. That's it.
 
-The app keeps the transcript, not the source recording. Audio is journaled temporarily so work can be recovered after an interruption or unexpected termination, then deleted after the transcript is saved successfully.
+The app stores only the text transcript, not the recording.
 
-## Product specification
+Audio is saved temporarily so work can be recovered after an interruption or unexpected termination, then deleted after the transcript is saved successfully.
+
+
+## Features
 
 - Record and transcribe microphone audio entirely on the iPhone.
-- Support long sessions without an app-imposed recording limit. Practical limits are available storage, battery life, and iOS resource management.
 - Continue recording while the screen is locked or the app is in the background.
 - Allow pausing and resuming an active session.
 - Show finalized and in-progress transcription while the app is visible.
 - Save completed transcripts as plain text files.
-- After each recording, clean up the transcript text, generate a title, and label speakers in multi-speaker recordings — all on-device and best-effort, never at the expense of the raw transcript.
-- Preserve useful work when recording is interrupted, the audio route changes, or the app terminates unexpectedly.
-- Retain raw audio only while it is required for in-progress recovery and post-recording speaker analysis.
-- Make transcripts available in the app, the Files app, and the iOS share sheet.
+- After each recording, clean up the transcript text, generate a title, and label speakers in multi-speaker recordings — all on-device.
 
 ## What is implemented
 
@@ -24,16 +23,6 @@ The app keeps the transcript, not the source recording. Audio is journaled tempo
 `AVAudioEngine` captures microphone buffers and `SpeechAnalyzer` with `SpeechTranscriber` performs transcription. Audio is converted into the analyzer's preferred format before it is streamed into the analysis pipeline. The app selects the best supported locale, falling back to US English or another available locale.
 
 Transcription does not require a network connection after the device has the appropriate speech model. iOS may perform a one-time model download before the first recording for a locale.
-
-### Readable paragraph heuristics
-
-`SpeechTranscriber` returns timed recognition chunks, not semantic paragraph or topic labels. Record turns those chunks into readable plain text using conservative, deterministic heuristics:
-
-- a pause of at least two seconds starts a new paragraph;
-- a pause of at least 1.25 seconds starts a new paragraph when the previous sentence is complete and the current paragraph is already at least 200 characters; and
-- shorter pauses join chunks with normal sentence spacing.
-
-The formatting runs live and during crash recovery, entirely on-device. These are presentation heuristics rather than topic detection; speaker labels and semantic cleanup are added afterward by the enhancement pass described below.
 
 ### Post-recording enhancement pass
 
@@ -44,10 +33,6 @@ After a transcript is saved (or recovered), Record runs a best-effort enhancemen
 3. **Title** — one guided-generation call names the file after the specific topic discussed.
 
 Every stage degrades independently: if diarization fails there are no speaker labels, if the language model is unavailable the text stays raw, and if title generation fails the date-based filename is kept. The raw transcript is durable on disk before the pass begins, and the pre-enhancement original remains viewable from the transcript detail screen. New recordings are disabled while a pass is running (typically one to two minutes for an hour-long session, with progress shown).
-
-### Pause and resume
-
-Recording can be paused and resumed from the recording screen. Pausing stops pulling microphone audio while keeping the session open; the pause consumes no storage, and the analyzer and journal timelines stay continuous so speaker attribution is unaffected. The transcript starts a new paragraph at the resume point. A system interruption (such as a phone call) while paused ends the session safely, exactly as it does while recording.
 
 ### Long recordings and background operation
 
@@ -71,31 +56,6 @@ Segmenting limits the amount of audio at risk if the process is terminated while
 - Raw audio is not exposed in Documents and is not retained after a successful transcript save.
 
 An interruption ends the current recording rather than resuming it automatically. This makes the save boundary explicit and avoids silently missing audio while iOS owns the microphone.
-
-### Transcript storage
-
-Transcripts are stored in the app's Documents directory as pure plain text. A transcript is first saved as `Recording YYYY-MM-DD at HH.mm.ss.txt`; when the enhancement pass generates a title, the file is renamed to `<Title> — YYYY-MM-DD HH.mm.txt`, keeping the timestamp for uniqueness and sorting.
-
-Transcripts can be:
-
-- opened, renamed, and deleted inside Record;
-- shared from the transcript detail screen; or
-- accessed under **On My iPhone → Record** in the Files app.
-
-The pre-enhancement original is kept privately in Application Support, is viewable via **View original** in the detail screen, and is deleted together with its transcript.
-
-## Project layout
-
-- `Record/RecordingController.swift` — recording lifecycle, pause/resume, speech analysis, interruptions, recovery, and enhancement orchestration.
-- `Record/RecordingJournal.swift` — temporary manifest, transcript checkpoint, saved-transcript marker, and segmented CAF writer.
-- `Record/BufferConverter.swift` — microphone-to-analyzer audio conversion.
-- `Record/TimedTranscript.swift` — timed transcript chunks and speaker-attribution logic.
-- `Record/TranscriptEnhancer.swift` — diarization, LLM text cleanup, and title generation.
-- `Record/TranscriptStore.swift` — durable transcript storage, renaming, and pre-enhancement originals.
-- `Record/ContentView.swift` — recording UI, recovery state, transcript list, sharing, and deletion.
-- `Record/Info.plist` — microphone permission, Files integration, and audio background mode.
-
-The project has one Swift package dependency, [FluidAudio](https://github.com/FluidInference/FluidAudio), for on-device speaker diarization. The first build needs network access to resolve it.
 
 ## Requirements
 
@@ -215,3 +175,7 @@ For an hour-plus lecture, begin with a charged device and sufficient free storag
 - Calls and other microphone interruptions end the active session after saving its captured portion.
 - Force-quitting prevents any further background capture; audio recorded before termination is recovered on the next launch.
 - Recovery protects against interrupted sessions, but no mobile app can guarantee capture after iOS terminates it, storage is exhausted, or the device loses power.
+
+## License
+
+Record is released under the [MIT License](LICENSE).
