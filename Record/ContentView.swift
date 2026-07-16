@@ -4,6 +4,7 @@ import UIKit
 struct ContentView: View {
     @State private var controller = RecordingController()
     @State private var transcripts: [Transcript] = []
+    @State private var showingStopEnhancementDialog = false
 
     var body: some View {
         NavigationStack {
@@ -50,7 +51,7 @@ struct ContentView: View {
             } else {
                 List {
                     ForEach(transcripts) { transcript in
-                        NavigationLink(value: transcript.url) {
+                        NavigationLink(value: transcript) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(transcript.title)
                                     .font(.headline)
@@ -67,11 +68,14 @@ struct ContentView: View {
                         transcripts = TranscriptStore.list()
                     }
                 }
-                .navigationDestination(for: URL.self) { url in
-                    if let transcript = transcripts.first(where: { $0.url == url }) {
-                        TranscriptDetailView(transcript: transcript) {
-                            transcripts = TranscriptStore.list()
-                        }
+                // The pushed value is used directly rather than re-looked-up
+                // in `transcripts`: a rename or enhancement changes the file's
+                // URL, and a lookup by the stale URL would find nothing and
+                // blank the screen. The detail view tracks changes to its own
+                // transcript state.
+                .navigationDestination(for: Transcript.self) { transcript in
+                    TranscriptDetailView(transcript: transcript) {
+                        transcripts = TranscriptStore.list()
                     }
                 }
             }
@@ -80,15 +84,21 @@ struct ContentView: View {
 
     private var liveTranscriptView: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                statusLabel
-                Text("\(controller.finalizedText)\(Text(controller.volatileText).foregroundStyle(.secondary))")
-                    .font(.body)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding()
+            Text("\(controller.finalizedText)\(Text(controller.volatileText).foregroundStyle(.secondary))")
+                .font(.body)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
         }
         .defaultScrollAnchor(.bottom)
+        // The scroll view is anchored to the bottom of a potentially long
+        // transcript, so the status has to sit outside it to stay visible.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            statusLabel
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal)
+                .padding(.vertical, 10)
+                .background(.bar)
+        }
     }
 
     private var statusLabel: some View {
@@ -109,8 +119,13 @@ struct ContentView: View {
                 Label("Finishing up…", systemImage: "hourglass")
             case .enhancing:
                 VStack(alignment: .leading, spacing: 6) {
-                    Label("Enhancing transcript…", systemImage: "sparkles")
-                        .symbolEffect(.pulse)
+                    Label(
+                        controller.enhancementCancelRequested
+                            ? "Stopping enhancement…"
+                            : "Enhancing transcript…",
+                        systemImage: "sparkles"
+                    )
+                    .symbolEffect(.pulse)
                     if let progress = controller.enhancementProgress {
                         ProgressView(value: progress)
                     }
@@ -142,7 +157,11 @@ struct ContentView: View {
             }
 
             Button {
-                controller.toggleRecording()
+                if controller.state == .enhancing {
+                    showingStopEnhancementDialog = true
+                } else {
+                    controller.toggleRecording()
+                }
             } label: {
                 Image(systemName: controller.isSessionActive ? "stop.fill" : "mic.fill")
                     .font(.title)
@@ -150,16 +169,30 @@ struct ContentView: View {
                     .background(controller.isSessionActive ? Color.red : Color.accentColor, in: Circle())
                     .foregroundStyle(.white)
             }
-            .disabled(
-                controller.state == .preparing
-                    || controller.state == .downloadingModel
-                    || controller.state == .recovering
-                    || controller.state == .stopping
-                    || controller.state == .enhancing
-            )
+            .disabled(recordButtonDisabled)
+            .opacity(recordButtonDisabled ? 0.4 : 1)
             .accessibilityLabel(controller.isSessionActive ? "Stop recording" : "Start recording")
         }
         .padding(.bottom, 8)
+        .confirmationDialog(
+            "Enhancement in progress",
+            isPresented: $showingStopEnhancementDialog,
+            titleVisibility: .visible
+        ) {
+            Button("Stop Enhancing and Record", role: .destructive) {
+                controller.stopEnhancingAndStartRecording()
+            }
+            Button("Keep Enhancing", role: .cancel) {}
+        } message: {
+            Text("Your transcript is already saved. Stopping skips the remaining polish — you can run Enhance later from the transcript — and starts a new recording.")
+        }
+    }
+
+    private var recordButtonDisabled: Bool {
+        controller.state == .preparing
+            || controller.state == .downloadingModel
+            || controller.state == .recovering
+            || controller.state == .stopping
     }
 }
 
@@ -171,10 +204,21 @@ struct TranscriptDetailView: View {
     @State private var showingRename = false
     @State private var renameText = ""
     @State private var renameErrorMessage: String?
+    @State private var isEnhancing = false
+    @State private var enhancementTask: Task<Void, Never>?
+    private let enhancer = TranscriptEnhancer()
 
     init(transcript: Transcript, onUpdate: @escaping () -> Void) {
         _transcript = State(initialValue: transcript)
         self.onUpdate = onUpdate
+    }
+
+    /// Enhancement is offered again as long as the pass never completed with
+    /// a generated title: either no original was stashed (cancelled or failed
+    /// early) or the file still carries its default "Recording" name
+    /// (cancelled partway through).
+    private var canEnhance: Bool {
+        !transcript.hasOriginal || transcript.title.hasPrefix("Recording ")
     }
 
     var body: some View {
@@ -183,6 +227,18 @@ struct TranscriptDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
                 .textSelection(.enabled)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if isEnhancing {
+                Label("Enhancing transcript…", systemImage: "sparkles")
+                    .symbolEffect(.pulse)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.vertical, 10)
+                    .background(.bar)
+            }
         }
         .navigationTitle(transcript.title)
         .navigationBarTitleDisplayMode(.inline)
@@ -194,12 +250,21 @@ struct TranscriptDetailView: View {
                 renameText = transcript.title
                 showingRename = true
             }
+            if canEnhance {
+                Button("Enhance", systemImage: "sparkles") {
+                    runEnhancement()
+                }
+                .disabled(isEnhancing)
+            }
             if transcript.hasOriginal {
                 Button("View original", systemImage: "doc.text.magnifyingglass") {
                     showingOriginal = true
                 }
             }
             ShareLink(item: transcript.url)
+        }
+        .onDisappear {
+            enhancementTask?.cancel()
         }
         .alert("Rename Transcript", isPresented: $showingRename) {
             TextField("Title", text: $renameText)
@@ -240,6 +305,33 @@ struct TranscriptDetailView: View {
             }
         }
         .task { bodyText = TranscriptStore.load(transcript) }
+    }
+
+    /// Re-runs the text-only enhancement stages (cleanup, inferred speaker
+    /// labels, title) on the saved transcript. The recording's audio journal
+    /// is gone by now, so acoustic diarization is not part of a re-run.
+    private func runEnhancement() {
+        guard !isEnhancing else { return }
+        isEnhancing = true
+        let input = EnhancementInput(
+            raw: transcript,
+            rawText: bodyText,
+            chunks: [],
+            audioSegmentURLs: [],
+            scratchDirectory: nil,
+            recordedAt: transcript.date
+        )
+        let enhancer = self.enhancer
+        enhancementTask = Task {
+            let enhanced = await enhancer.enhance(input) {}
+            if let enhanced {
+                transcript = enhanced
+                bodyText = TranscriptStore.load(enhanced)
+                onUpdate()
+            }
+            isEnhancing = false
+            enhancementTask = nil
+        }
     }
 }
 

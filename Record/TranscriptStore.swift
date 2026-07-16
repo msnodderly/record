@@ -1,6 +1,6 @@
 import Foundation
 
-struct Transcript: Identifiable, Equatable {
+struct Transcript: Identifiable, Hashable {
     let url: URL
     let date: Date
 
@@ -121,8 +121,18 @@ enum TranscriptStore {
 
         try FileManager.default.createDirectory(at: originalsDirectory, withIntermediateDirectories: true)
         let originalURL = originalsDirectory.appendingPathComponent(targetURL.lastPathComponent)
-        try? FileManager.default.removeItem(at: originalURL)
-        try FileManager.default.copyItem(at: raw.url, to: originalURL)
+        // A re-run of enhancement already has an original stashed from the
+        // first pass; carry that one forward instead of overwriting it with
+        // the partially enhanced text being re-enhanced now.
+        if let existingOriginalURL = Self.originalURL(for: raw.url) {
+            if existingOriginalURL != originalURL {
+                try? FileManager.default.removeItem(at: originalURL)
+                try FileManager.default.moveItem(at: existingOriginalURL, to: originalURL)
+            }
+        } else {
+            try? FileManager.default.removeItem(at: originalURL)
+            try FileManager.default.copyItem(at: raw.url, to: originalURL)
+        }
 
         try body.write(to: targetURL, atomically: true, encoding: .utf8)
         if targetURL != raw.url {

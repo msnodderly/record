@@ -28,6 +28,7 @@ final class RecordingController {
     var errorMessage: String?
     private(set) var lastSavedTranscript: Transcript?
     private(set) var enhancementProgress: Double?
+    private(set) var enhancementCancelRequested = false
 
     private let audioEngine = AVAudioEngine()
     private let converter = BufferConverter()
@@ -52,6 +53,7 @@ final class RecordingController {
 
     private let enhancer = TranscriptEnhancer()
     private var enhancementTask: Task<Transcript?, Never>?
+    private var startRecordingAfterEnhancement = false
 
     private static let strongParagraphPause: TimeInterval = 2.0
     private static let contextualParagraphPause: TimeInterval = 1.25
@@ -89,6 +91,17 @@ final class RecordingController {
         default:
             break
         }
+    }
+
+    /// Abandons the in-flight enhancement pass and starts a new recording as
+    /// soon as it has wound down. The raw transcript is already saved;
+    /// whatever stages finished before the cancellation are kept, and the
+    /// text-only stages can be re-run later from the transcript's detail view.
+    func stopEnhancingAndStartRecording() {
+        guard state == .enhancing, let enhancementTask else { return }
+        startRecordingAfterEnhancement = true
+        enhancementCancelRequested = true
+        enhancementTask.cancel()
     }
 
     /// Pausing stops pulling microphone buffers while keeping the analyzer,
@@ -176,6 +189,7 @@ final class RecordingController {
         }
 
         state = .idle
+        await startRecordingIfRequestedAfterEnhancement()
     }
 
     // MARK: - Start
@@ -409,6 +423,16 @@ final class RecordingController {
         }
 
         state = .idle
+        await startRecordingIfRequestedAfterEnhancement()
+    }
+
+    /// Honors a "stop enhancing and record" request once the cancelled
+    /// enhancement pass has fully wound down and the state is idle again.
+    private func startRecordingIfRequestedAfterEnhancement() async {
+        guard startRecordingAfterEnhancement else { return }
+        startRecordingAfterEnhancement = false
+        guard state == .idle else { return }
+        await startRecording()
     }
 
     // MARK: - Enhancement
@@ -425,6 +449,7 @@ final class RecordingController {
     ) async {
         state = .enhancing
         enhancementProgress = nil
+        enhancementCancelRequested = false
 
         // Recording no longer holds the audio session, so request the short
         // grace period iOS grants for finishing work after backgrounding. If
@@ -464,6 +489,7 @@ final class RecordingController {
         }
         enhancementTask = nil
         enhancementProgress = nil
+        enhancementCancelRequested = false
 
         // Cancellation can end the pass before it reaches the deletion
         // callback; the transcript is saved, so the journal must not linger.
