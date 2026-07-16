@@ -78,14 +78,70 @@ Transcripts are named `Recording YYYY-MM-DD at HH.mm.ss.txt` and stored in the a
 - A physical iPhone running iOS 26 or later. The on-device speech models are not available in the Simulator.
 - An Apple signing team. A free Personal Team is sufficient for installing on your own iPhone, though Personal Team builds generally need to be reinstalled after their provisioning period expires.
 
-## Build and run
+## Deployment
 
-1. Open `Record.xcodeproj` in Xcode.
-2. Select the **Record** target, open **Signing & Capabilities**, enable automatic signing, and choose your team.
-3. Connect and unlock an iPhone, choose it as the run destination, and press **Run** (`Command-R`).
-4. Grant microphone permission on first use.
+The project currently supports development deployment to a personally owned iPhone. TestFlight and App Store distribution are not configured.
 
-For a command-line compile check:
+### First-time signing setup
+
+1. Open Xcode, then choose **Xcode → Settings → Accounts**.
+2. Add an Apple ID. A free account creates a **Personal Team** and is sufficient for installing Record on your own device.
+3. Open `Record.xcodeproj`.
+4. Select the **Record** target, open **Signing & Capabilities**, and enable **Automatically manage signing**.
+5. Choose your team. The checked-in bundle identifier is `com.mds.Record`; if Xcode reports that it is unavailable, change it to a unique identifier you control.
+6. On the iPhone, enable **Settings → Privacy & Security → Developer Mode** if iOS requests it, then restart the phone as directed.
+
+Personal Team provisioning normally expires after seven days. Rebuild and reinstall the app using the same bundle identifier when it expires. A paid Apple Developer Program membership is not required for this personal-device workflow.
+
+### Deploy with Xcode
+
+1. Connect the iPhone by cable, unlock it, and accept **Trust This Computer** if prompted.
+2. Select the iPhone in Xcode's run-destination menu.
+3. Press **Run** (`Command-R`). Xcode builds, signs, installs, and launches Record.
+4. Grant microphone permission on first use. If iOS blocks the first launch as an untrusted developer, open **Settings → General → VPN & Device Management**, select the developer identity, and trust it.
+
+Subsequent deployments use the same steps. Installing a newer build with the same bundle identifier preserves the app's Documents container under normal development-install behavior. Do not delete the app if its transcripts have not been exported; uninstalling removes its local data.
+
+### Deploy from the command line
+
+The following is the command-line equivalent of the deployment used during development.
+
+First, list paired devices and copy the target iPhone's identifier:
+
+```bash
+xcrun devicectl list devices
+```
+
+Build and sign the app. Xcode obtains or refreshes the provisioning profile when needed:
+
+```bash
+xcodebuild \
+  -project Record.xcodeproj \
+  -scheme Record \
+  -configuration Debug \
+  -destination 'generic/platform=iOS' \
+  -derivedDataPath /tmp/record-device-build \
+  -allowProvisioningUpdates \
+  build
+```
+
+Install and launch it, replacing `<DEVICE-ID>` with the identifier reported above. If the bundle identifier was changed, also replace `com.mds.Record` in the launch command.
+
+```bash
+xcrun devicectl device install app \
+  --device '<DEVICE-ID>' \
+  /tmp/record-device-build/Build/Products/Debug-iphoneos/Record.app
+
+xcrun devicectl device process launch \
+  --device '<DEVICE-ID>' \
+  com.mds.Record
+```
+
+Keep the iPhone unlocked while installing or launching. To deploy an update, repeat the build, install, and launch commands.
+
+### Compile without signing
+
+For CI or a local compile check that does not install the app:
 
 ```bash
 xcodebuild \
@@ -96,6 +152,17 @@ xcodebuild \
   CODE_SIGNING_ALLOWED=NO \
   build
 ```
+
+### Deployment troubleshooting
+
+- **No signing certificate or team:** sign in again under **Xcode → Settings → Accounts**, then reselect the team under **Signing & Capabilities**.
+- **Bundle identifier unavailable:** replace `com.mds.Record` with a unique reverse-DNS identifier in the target's Signing settings.
+- **Device unavailable:** unlock the phone, reconnect the cable, accept the trust prompt, and rerun `xcrun devicectl list devices`.
+- **Provisioning profile expired:** rebuild with Xcode or rerun the signed command-line deployment. This is expected periodically with a Personal Team.
+- **Launch is blocked:** enable Developer Mode and trust the developer identity in the iPhone settings described above.
+- **Speech model preparation takes time:** keep the app open and online for the first recording in a new language so iOS can download its on-device model.
+
+TestFlight or App Store deployment would additionally require a paid Apple Developer Program membership, distribution signing, an archived Release build, App Store Connect configuration, privacy details, and review. None of those release artifacts are currently included in this repository.
 
 ## Smoke test
 
