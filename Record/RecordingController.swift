@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreMedia
 import Foundation
 import Speech
 
@@ -37,6 +38,11 @@ final class RecordingController {
     private var journalWriter: AudioJournalWriter?
     private var tapInstalled = false
     private var analysisFailure: Error?
+    private var lastFinalizedResultEnd: CMTime?
+
+    private static let strongParagraphPause: TimeInterval = 2.0
+    private static let contextualParagraphPause: TimeInterval = 1.25
+    private static let minimumContextualParagraphLength = 200
 
     var isRecording: Bool { state == .recording }
     var liveTranscript: String { finalizedText + volatileText }
@@ -82,6 +88,7 @@ final class RecordingController {
             finalizedText = ""
             volatileText = ""
             analysisFailure = nil
+            lastFinalizedResultEnd = nil
 
             let checkpoint = pendingJournal.loadCheckpoint()
             do {
@@ -121,6 +128,7 @@ final class RecordingController {
         volatileText = ""
         lastSavedTranscript = nil
         analysisFailure = nil
+        lastFinalizedResultEnd = nil
 
         do {
             guard await AVAudioApplication.requestRecordPermission() else {
@@ -199,10 +207,16 @@ final class RecordingController {
             do {
                 for try await result in transcriber.results {
                     guard let self else { return }
-                    let text = String(result.text.characters)
+                    let text = self.formattedTranscriptionChunk(
+                        String(result.text.characters),
+                        range: result.range
+                    )
                     if result.isFinal {
                         self.finalizedText += text
                         self.volatileText = ""
+                        if !text.isEmpty {
+                            self.lastFinalizedResultEnd = CMTimeRangeGetEnd(result.range)
+                        }
                         try? journal?.saveCheckpoint(self.finalizedText)
                     } else {
                         self.volatileText = text
@@ -377,6 +391,49 @@ final class RecordingController {
         transcriber = nil
         converter.reset()
         analysisFailure = nil
+        lastFinalizedResultEnd = nil
+    }
+
+    // MARK: - Paragraph formatting
+
+    /// SpeechTranscriber returns recognition chunks rather than semantic
+    /// paragraphs. Use timing, punctuation, and paragraph length to create
+    /// stable, readable boundaries without requiring a second model.
+    private func formattedTranscriptionChunk(_ text: String, range: CMTimeRange) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        guard !finalizedText.isEmpty else { return trimmed }
+
+        if shouldStartNewParagraph(for: range) {
+            return "\n\n" + trimmed
+        }
+
+        let punctuationThatDoesNotNeedLeadingSpace = CharacterSet(charactersIn: ".,!?;:%)]}…")
+        if let firstScalar = trimmed.unicodeScalars.first,
+           punctuationThatDoesNotNeedLeadingSpace.contains(firstScalar) {
+            return trimmed
+        }
+        return " " + trimmed
+    }
+
+    private func shouldStartNewParagraph(for range: CMTimeRange) -> Bool {
+        guard let lastFinalizedResultEnd else { return false }
+        let pause = CMTimeGetSeconds(CMTimeSubtract(range.start, lastFinalizedResultEnd))
+        guard pause.isFinite, pause >= 0 else { return false }
+
+        if pause >= Self.strongParagraphPause {
+            return true
+        }
+
+        let currentParagraphLength = finalizedText
+            .components(separatedBy: "\n\n")
+            .last?
+            .count ?? 0
+        return pause >= Self.contextualParagraphPause
+            && currentParagraphLength >= Self.minimumContextualParagraphLength
+            && finalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                .last
+                .map { ".!?…".contains($0) } == true
     }
 
     // MARK: - Recovery
@@ -394,6 +451,7 @@ final class RecordingController {
         finalizedText = ""
         volatileText = ""
         analysisFailure = nil
+        lastFinalizedResultEnd = nil
         converter.reset()
         startResultsTask(for: transcriber, checkpointing: nil)
 

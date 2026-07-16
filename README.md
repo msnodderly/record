@@ -23,6 +23,16 @@ The app keeps the transcript, not the source recording. Audio is journaled tempo
 
 Transcription does not require a network connection after the device has the appropriate speech model. iOS may perform a one-time model download before the first recording for a locale.
 
+### Readable paragraph heuristics
+
+`SpeechTranscriber` returns timed recognition chunks, not semantic paragraph or topic labels. Record turns those chunks into readable plain text using conservative, deterministic heuristics:
+
+- a pause of at least two seconds starts a new paragraph;
+- a pause of at least 1.25 seconds starts a new paragraph when the previous sentence is complete and the current paragraph is already at least 200 characters; and
+- shorter pauses join chunks with normal sentence spacing.
+
+The formatting runs live and during crash recovery, entirely on-device. These are presentation heuristics rather than topic detection, and the API does not currently provide speaker diarization.
+
 ### Long recordings and background operation
 
 The app configures an `AVAudioSession` for recording and declares the `audio` background mode. Recording can therefore continue when Record is backgrounded or the screen locks; there is no need to keep the screen awake or periodically interact with it.
@@ -92,9 +102,10 @@ xcodebuild \
 Run these checks on a physical iPhone:
 
 1. Start a recording, speak for a minute, lock the screen, wait another minute, unlock, and stop. Confirm the transcript includes speech from both periods.
-2. Start another recording, speak long enough to produce visible text, then force-quit Record. Reopen it and wait for recovery to finish. Confirm a transcript appears.
-3. Open the recovered transcript, use Share, and verify the same file appears in **Files → On My iPhone → Record**.
-4. Delete an unneeded transcript from the list and confirm it disappears from Files.
+2. Record one sentence, pause silently for at least three seconds, then record another sentence. Stop and confirm the saved transcript has a blank line between them.
+3. Start another recording, speak long enough to produce visible text, then force-quit Record. Reopen it and wait for recovery to finish. Confirm a transcript appears.
+4. Open the recovered transcript, use Share, and verify the same file appears in **Files → On My iPhone → Record**.
+5. Delete an unneeded transcript from the list and confirm it disappears from Files.
 
 For an hour-plus lecture, begin with a charged device and sufficient free storage. Temporary uncompressed PCM audio is stored for the duration of the session and removed only after the transcript is safely saved.
 
