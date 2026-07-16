@@ -9,6 +9,8 @@ Good luck! -Matt
 
 <img width="330"  alt="IMG_6749" src="https://github.com/user-attachments/assets/b8b99ad8-f753-49c4-9bad-9d73fba4e719" />
 
+As you can see from the screenshot the transcriptions are not perfect, but as far as I can tell this is as good as it's possible to get for a local model on mobile, as of mid-2026.
+
 
 ## Features
 The app stores only the text transcript, not the recording.
