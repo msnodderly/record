@@ -1,13 +1,18 @@
 # Record
+I just wanted to take notes by talking to my iPhone. This is a super-simple 100% on-device iPhone transcription app. Transcribes audio, cleans it up, lets you copy or share the text.
 
-Super-simple 100% on-device iPhone transcription app. Transcribes audio, cleans it up, lets you copy or share the text. That's it.
+Feel free to use it.
 
-The app stores only the text transcript, not the recording.
+Connect your iPhone with iOS 26+ to your Mac running MacOS 15.7+, point your favorite AI agent at this README.md and tell it to figure out how to build and install it for you. 
 
-Audio is saved temporarily so work can be recovered after an interruption or unexpected termination, then deleted after the transcript is saved successfully.
+Good luck! -Matt
+
 
 
 ## Features
+The app stores only the text transcript, not the recording.
+
+Audio is saved temporarily so work can be recovered after an interruption or unexpected termination, then deleted after the transcript is saved successfully.
 
 - Record and transcribe microphone audio entirely on the iPhone.
 - Continue recording while the screen is locked or the app is in the background.
