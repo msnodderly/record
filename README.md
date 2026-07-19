@@ -12,6 +12,8 @@ Good luck! -Matt
 As you can see from the screenshot the transcriptions are not perfect, but as far as I can tell this is as good as it's possible to get for a local model on mobile, as of mid-2026.
 
 
+AI slop starts here:
+
 ## Features
 The app stores only the text transcript, not the recording.
 
